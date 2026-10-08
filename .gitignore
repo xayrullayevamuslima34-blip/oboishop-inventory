@@ -1,0 +1,35 @@
+node_modules/
+.pnpm-store/
+dist/
+build/
+.next/
+.env
+.env.local
+*.log
+.DS_Store
+coverage/
+.turbo/
+
+# User-uploaded product images (local disk storage — see prisma
+# schema.prisma Product.imageUrl comment). Not code, don't version it; back
+# it up separately in production (see docs/DEPLOYMENT.md).
+apps/api/uploads/
+
+# Barcha .env variantlari (zaxira nusxalar ham) — namunadan tashqari.
+# Masalan apps/api/.env.docker-backup ichida JWT_SECRET va baza paroli bor.
+.env.*
+!.env.example
+
+# Vercel artifacts
+.vercel/
+
+# TypeScript inkremental build keshi
+*.tsbuildinfo
+
+# Claude Code shaxsiy sozlamalari (mahalliy yo'lar va shaxsiy ma'lumotlar)
+.claude/settings.local.json
+
+# IDE / tooling
+.idea/
+.vscode/
+.claude/

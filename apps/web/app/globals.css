@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+/* Money/quantity figures should always use tabular numerals so columns of
+   numbers in tables/reports line up — this matters a lot for a financial app. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

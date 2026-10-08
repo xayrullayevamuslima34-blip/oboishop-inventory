@@ -1,0 +1,566 @@
+// Oboi-Shop Sklad — Prisma schema
+// Phase 1: auth + master data (users, tags, products, contragents).
+// Phase 2: batches, stock-in/stock-out documents, FIFO allocations, movement ledger.
+// Later phases append: inventory counts, contragent ledger, cash box, expenses —
+// see /docs/ARCHITECTURE.md and the approved plan for the full model. Keeping the schema
+// additive per phase avoids designing tables before the business rules around them are
+// locked in.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum UserRole {
+  SKLAD_MENEJERI
+}
+
+enum ContragentType {
+  CUSTOMER
+  SUPPLIER
+  BOTH
+}
+
+enum BaseMaterial {
+  VINIL
+  FLIZELIN
+  BOSHQA
+}
+
+enum ProductUnit {
+  RULON
+  DONA
+  METR
+}
+
+enum DocumentStatus {
+  DRAFT
+  CONFIRMED
+  CANCELLED
+}
+
+// Hippo'da alohida bo'limlar (Sotuvlar/Qaytaruvlar/Yetkazib beruvchiga
+// qaytaruvlar/Hisobdan chiqarishlar) shu bitta polimorfik hujjat modeliga
+// tushadi — ular barchasi "chiqim" (stock decreases via FIFO) yoki
+// CUSTOMER_RETURN holida "kirim" (yangi partiya) sifatida bir xil FIFO
+// dvigatelidan foydalanadi. Qarang: stockOutService.ts.
+enum StockOutDocType {
+  SALE
+  CUSTOMER_RETURN
+  RETURN_TO_SUPPLIER
+  WRITEOFF
+}
+
+// Balans ishorasi konvensiyasi (barcha kontragentlar uchun bir xil):
+// musbat balans = kontragent BIZGA qarzdor; manfiy balans = BIZ kontragentga
+// qarzdormiz. Har bir entryType uchun ishora servis qatlamida qat'iy
+// belgilanadi (mijoz tomonidan o'zgartirib bo'lmaydi) — faqat ADJUSTMENT
+// istisno, u qo'lda kiritilgan ishorani saqlaydi. Qarang: contragentLedgerService.ts.
+enum LedgerEntryType {
+  INVOICE // Kirim confirm'da avtomatik (yetkazib beruvchi ko'rsatilgan bo'lsa) — har doim manfiy.
+  PAYMENT // Qo'lda kiritiladigan to'lov — yo'nalishga qarab ishora aniqlanadi.
+  PREPAYMENT // Qo'lda kiritiladigan oldindan to'lov — PAYMENT bilan bir xil ishora mantiqi.
+  ADJUSTMENT // Qo'lda tuzatish — ishora foydalanuvchi kiritgani bo'yicha saqlanadi.
+  CANCEL_REVERSAL // Kirim bekor qilinganda INVOICE yozuvini teskari qaytaradi.
+}
+
+// v1'da yagona naqd kassa — alohida "CashBox" jadval shart emas, balans
+// har doim SUM(cash_transactions.amount) dan hisoblanadi (boshqa
+// balanslar bilan bir xil tamoyil). Qarang: cashBoxService.ts.
+enum CashTransactionType {
+  SALE_INCOME // Sotuv (SALE) confirm bo'lganda avtomatik — har doim musbat.
+  MANUAL_INCOME // Qo'lda kiritilgan kirim — musbat.
+  EXPENSE // Xarajat (turkum bilan) — har doim manfiy.
+  CANCEL_REVERSAL // Sotuv bekor qilinganda SALE_INCOME'ni teskari qaytaradi.
+}
+
+enum NotificationType {
+  LOW_STOCK
+  DEBT_THRESHOLD
+}
+
+enum MovementType {
+  STOCK_IN
+  SALE
+  WRITEOFF
+  RETURN_TO_SUPPLIER
+  CUSTOMER_RETURN
+  CANCEL_REVERSAL
+  INVENTORY_ADJ_PLUS
+  INVENTORY_ADJ_MINUS
+}
+
+// ---------- Auth / master data ----------
+
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  role         UserRole @default(SKLAD_MENEJERI)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  auditLogs AuditLog[]
+
+  @@map("users")
+}
+
+model Tag {
+  id        String       @id @default(uuid())
+  name      String       @unique
+  createdAt DateTime     @default(now()) @map("created_at")
+  products  ProductTag[]
+
+  @@map("tags")
+}
+
+model Product {
+  id                String       @id @default(uuid())
+  sku               String       @unique
+  name              String
+  // Mahsulot turi — turkum/brend o'rniga bitta erkin matnli maydon (mijoz
+  // talabi). Alohida jadval emas: ro'yxatdagi filtr mavjud qiymatlardan
+  // yig'iladi, shuning uchun turlarni boshqarish uchun alohida sahifa kerak emas.
+  type              String?
+  baseMaterial      BaseMaterial @default(BOSHQA) @map("base_material")
+  sizeWidthM        Decimal?     @map("size_width_m") @db.Decimal(6, 3)
+  sizeLengthM       Decimal?     @map("size_length_m") @db.Decimal(6, 3)
+  unit              ProductUnit  @default(RULON)
+  // Qadoq (o'ram) — ixtiyoriy. `packSize` bitta qadoq ichidagi asosiy
+  // birlikdagi miqdor (masalan 1 quti = 10 dona). To'ldirilgan bo'lsa,
+  // ro'yxatda "o'ram qoldiq" hisoblanadi va kassada qadoq bilan sotish
+  // mumkin bo'ladi — hujjatga baribir asosiy birlikdagi miqdor yoziladi.
+  packName          String?      @map("pack_name")
+  packSize          Decimal?     @map("pack_size") @db.Decimal(12, 3)
+  barcode           String?      @unique
+  // Local-disk-served path (e.g. "/uploads/products/<uuid>.jpg") — see
+  // apps/api/src/routes/products.ts image upload endpoint. Not a full
+  // object-storage integration; fine for a single-shop deployment, but note
+  // for docs/DEPLOYMENT.md: the uploads/ dir must be included in backups
+  // and survive redeploys.
+  imageUrl          String?      @map("image_url")
+  // "Chakana narx" — v1'dan beri mavjud yagona narx, nomi o'zgarmadi
+  // (migratsiyani soddalashtirish uchun), lekin frontend'da endi "Chakana
+  // narx" deb ko'rsatiladi, "ulgurji narx"ga qarama-qarshi qo'yilgan holda.
+  defaultSalePrice  BigInt?      @map("default_sale_price")
+  wholesalePrice    BigInt?      @map("wholesale_price")
+  // Kirim narxi (tan narx) — ma'lumot uchun ko'rsatkich. So'mdan boshqa
+  // valyutada ham kiritilishi mumkin, shuning uchun BigInt emas Decimal.
+  // FIFO tannarx hisobi bunga tayanmaydi — u kirim partiyalaridan olinadi.
+  purchasePrice     Decimal?     @map("purchase_price") @db.Decimal(14, 2)
+  purchaseCurrency  String?      @map("purchase_currency")
+  minStockThreshold Decimal?     @map("min_stock_threshold") @db.Decimal(12, 3)
+  isActive          Boolean      @default(true) @map("is_active")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+
+  tags ProductTag[]
+
+  batches             Batch[]
+  stockInItems        StockInDocumentItem[]
+  stockOutItems       StockOutDocumentItem[]
+  stockMovements      StockMovement[]
+  productStockBalance ProductStockBalance?
+  inventoryCountItems InventoryCountItem[]
+
+  @@map("products")
+}
+
+model ProductTag {
+  productId String  @map("product_id")
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  tagId     String  @map("tag_id")
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([productId, tagId])
+  @@map("product_tags")
+}
+
+model Contragent {
+  id        String         @id @default(uuid())
+  name      String
+  type      ContragentType
+  phone     String?
+  address   String?
+  note      String?
+  isActive  Boolean        @default(true) @map("is_active")
+  createdAt DateTime       @default(now()) @map("created_at")
+  updatedAt DateTime       @updatedAt @map("updated_at")
+
+  stockInDocuments  StockInDocument[]
+  stockOutDocuments StockOutDocument[]
+  batchesSupplied   Batch[]
+  ledgerEntries     ContragentLedgerEntry[]
+
+  @@map("contragents")
+}
+
+// O'zgarmas (append-only) qarz/to'lov jurnali — balans har doim
+// SUM(amount) dan hisoblanadi (drift imkonsiz), incremental saqlanmaydi.
+model ContragentLedgerEntry {
+  id                    String          @id @default(uuid())
+  contragentId          String          @map("contragent_id")
+  contragent            Contragent      @relation(fields: [contragentId], references: [id], onDelete: Restrict)
+  entryType             LedgerEntryType @map("entry_type")
+  // Ishorali (signed) summa — musbat: balans "bizga qarz" tomon o'sadi;
+  // manfiy: "bizning qarzimiz" tomon o'sadi. Ishora entryType bo'yicha
+  // servis qatlamida belgilanadi (ADJUSTMENT bundan mustasno).
+  amount                BigInt
+  referenceDocumentType String?         @map("reference_document_type")
+  referenceDocumentId   String?         @map("reference_document_id")
+  note                  String?
+  createdBy             String?         @map("created_by")
+  createdAt             DateTime        @default(now()) @map("created_at")
+
+  @@index([contragentId, createdAt])
+  @@map("contragent_ledger_entries")
+}
+
+// ---------- Ombor operatsiyalari (Phase 2) ----------
+//
+// FIFO yadrosi: har "kirim" partiya (Batch) yaratadi; har "chiqim"
+// (sale/writeoff/return_to_supplier) shu partiyalarni received_at bo'yicha
+// eng eskisidan boshlab iste'mol qiladi (StockOutAllocation orqali — har
+// taqsimot alohida yoziladi, to'liq audit qilinadigan va qaytariladigan).
+// stock_movements — o'zgarmas (append-only) umumiy jurnal, balansning
+// yagona haqiqiy manbasi. Batafsil: docs/ARCHITECTURE.md.
+
+model Batch {
+  id            String      @id @default(uuid())
+  productId     String      @map("product_id")
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  supplierId    String?     @map("supplier_id")
+  supplier      Contragent? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  batchNumber   String      @unique @map("batch_number")
+  receivedAt    DateTime    @map("received_at")
+  purchasePrice BigInt      @map("purchase_price")
+  qtyReceived   Decimal     @map("qty_received") @db.Decimal(12, 3)
+  qtyRemaining  Decimal     @map("qty_remaining") @db.Decimal(12, 3)
+  // Set only when the stock-in document that created this batch was
+  // cancelled (always qty_remaining=0 at that point, see stockInService).
+  // NOT set when a batch is simply sold down to zero through normal FIFO
+  // consumption — those batches are excluded from allocation purely by the
+  // qty_remaining > 0 filter.
+  isClosed      Boolean     @default(false) @map("is_closed")
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  stockInItems             StockInDocumentItem[]
+  stockOutItems            StockOutDocumentItem[]
+  allocations              StockOutAllocation[]
+  movements                StockMovement[]
+  inventoryCountSurplusFor InventoryCountItem[]            @relation("InventoryCountSurplusBatch")
+  inventoryAllocations     InventoryAdjustmentAllocation[]
+
+  @@index([productId, receivedAt])
+  @@map("batches")
+}
+
+model StockInDocument {
+  id           String         @id @default(uuid())
+  docNumber    String         @unique @map("doc_number")
+  supplierId   String?        @map("supplier_id")
+  supplier     Contragent?    @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  status       DocumentStatus @default(DRAFT)
+  documentDate DateTime       @map("document_date")
+  note         String?
+  createdBy    String         @map("created_by")
+  confirmedBy  String?        @map("confirmed_by")
+  confirmedAt  DateTime?      @map("confirmed_at")
+  cancelledBy  String?        @map("cancelled_by")
+  cancelledAt  DateTime?      @map("cancelled_at")
+  cancelReason String?        @map("cancel_reason")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+
+  items StockInDocumentItem[]
+
+  @@map("stock_in_documents")
+}
+
+model StockInDocumentItem {
+  id            String          @id @default(uuid())
+  documentId    String          @map("document_id")
+  document      StockInDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  productId     String          @map("product_id")
+  product       Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  qty           Decimal         @db.Decimal(12, 3)
+  purchasePrice BigInt          @map("purchase_price")
+  lineTotal     BigInt          @map("line_total")
+  // Set on confirm — the batch this line created.
+  batchId       String?         @map("batch_id")
+  batch         Batch?          @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  @@map("stock_in_document_items")
+}
+
+model StockOutDocument {
+  id           String          @id @default(uuid())
+  docNumber    String          @unique @map("doc_number")
+  docType      StockOutDocType @map("doc_type")
+  contragentId String?         @map("contragent_id")
+  contragent   Contragent?     @relation(fields: [contragentId], references: [id], onDelete: Restrict)
+  status       DocumentStatus  @default(DRAFT)
+  documentDate DateTime        @map("document_date")
+  note         String?
+  createdBy    String          @map("created_by")
+  confirmedBy  String?         @map("confirmed_by")
+  confirmedAt  DateTime?       @map("confirmed_at")
+  cancelledBy  String?         @map("cancelled_by")
+  cancelledAt  DateTime?       @map("cancelled_at")
+  cancelReason String?         @map("cancel_reason")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  items StockOutDocumentItem[]
+
+  @@map("stock_out_documents")
+}
+
+model StockOutDocumentItem {
+  id               String           @id @default(uuid())
+  documentId       String           @map("document_id")
+  document         StockOutDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  productId        String           @map("product_id")
+  product          Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+  qty              Decimal          @db.Decimal(12, 3)
+  // SALE — sotuv narxi; CUSTOMER_RETURN — qaytarilayotgan mahsulotning
+  // tan narxi (yangi partiya shu narx bilan ochiladi). WRITEOFF/
+  // RETURN_TO_SUPPLIER uchun ikkalasi ham bo'sh qolishi mumkin.
+  salePrice        BigInt?          @map("sale_price")
+  unitCost         BigInt?          @map("unit_cost")
+  lineTotal        BigInt?          @map("line_total")
+  // Confirm'da FIFO taqsimotidan hisoblanadi (SALE/WRITEOFF/RETURN_TO_SUPPLIER).
+  costOfGoodsTotal BigInt?          @map("cost_of_goods_total")
+  // Faqat CUSTOMER_RETURN uchun: confirm'da shu qator ochgan yangi partiya —
+  // cancel qilinganda qaysi partiyani yopish kerakligini bilish uchun kerak
+  // (stock_in_document_item.batch_id bilan bir xil naqsh).
+  batchId          String?          @map("batch_id")
+  batch            Batch?           @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  allocations StockOutAllocation[]
+
+  @@map("stock_out_document_items")
+}
+
+// FIFO taqsimotining audit-kritik detali — qaysi chiqim qaysi partiyadan
+// qancha va qanday tan narxda olganini alohida saqlaydi.
+model StockOutAllocation {
+  id                   String               @id @default(uuid())
+  stockOutItemId       String               @map("stock_out_item_id")
+  stockOutItem         StockOutDocumentItem @relation(fields: [stockOutItemId], references: [id], onDelete: Cascade)
+  batchId              String               @map("batch_id")
+  batch                Batch                @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  qtyTaken             Decimal              @map("qty_taken") @db.Decimal(12, 3)
+  unitCostAtAllocation BigInt               @map("unit_cost_at_allocation")
+  createdAt            DateTime             @default(now()) @map("created_at")
+
+  @@map("stock_out_allocations")
+}
+
+// O'zgarmas (append-only) umumiy jurnal — balansning yagona haqiqiy manbasi
+// va audit trail. Hech qachon UPDATE/DELETE qilinmaydi.
+model StockMovement {
+  id                    String       @id @default(uuid())
+  productId             String       @map("product_id")
+  product               Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  batchId               String?      @map("batch_id")
+  batch                 Batch?       @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  movementType          MovementType @map("movement_type")
+  qtyDelta              Decimal      @map("qty_delta") @db.Decimal(12, 3)
+  referenceDocumentType String       @map("reference_document_type")
+  referenceDocumentId   String       @map("reference_document_id")
+  createdBy             String?      @map("created_by")
+  createdAt             DateTime     @default(now()) @map("created_at")
+
+  @@index([productId, createdAt])
+  @@map("stock_movements")
+}
+
+// Tezkor o'qish uchun denormalizatsiya — HAQIQIY MANBA EMAS. Har doim
+// SUM(batches.qty_remaining)dan to'liq qayta hisoblanadi (recomputeProductBalance),
+// incremental ravishda emas — shu orqali drift imkonsiz bo'ladi.
+model ProductStockBalance {
+  productId String   @id @map("product_id")
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  qtyOnHand Decimal  @default(0) @map("qty_on_hand") @db.Decimal(12, 3)
+  avgCost   BigInt?  @map("avg_cost")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("product_stock_balance")
+}
+
+// ---------- Reviziya / inventarizatsiya (Phase 3) ----------
+//
+// Har bir qator yaratilgan paytda joriy qoldiqni (system_qty) suratga
+// oladi; menejer counted_qty kiritadi. Confirm'da farq (counted - system)
+// hisoblanadi: musbat farq — yangi partiya ochiladi (CUSTOMER_RETURN bilan
+// bir xil naqsh), manfiy farq — FIFO orqali iste'mol qilinadi (WRITEOFF
+// bilan bir xil naqsh). Farq nolga teng bo'lsa hech narsa o'zgarmaydi.
+
+model InventoryCount {
+  id           String         @id @default(uuid())
+  docNumber    String         @unique @map("doc_number")
+  status       DocumentStatus @default(DRAFT)
+  countDate    DateTime       @map("count_date")
+  note         String?
+  createdBy    String         @map("created_by")
+  confirmedBy  String?        @map("confirmed_by")
+  confirmedAt  DateTime?      @map("confirmed_at")
+  cancelledBy  String?        @map("cancelled_by")
+  cancelledAt  DateTime?      @map("cancelled_at")
+  cancelReason String?        @map("cancel_reason")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+
+  items InventoryCountItem[]
+
+  @@map("inventory_counts")
+}
+
+model InventoryCountItem {
+  id               String         @id @default(uuid())
+  inventoryCountId String         @map("inventory_count_id")
+  inventoryCount   InventoryCount @relation(fields: [inventoryCountId], references: [id], onDelete: Cascade)
+  productId        String         @map("product_id")
+  product          Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  // Yaratilgan paytdagi qoldiq surati (draft holatida ham o'zgarmaydi —
+  // taqqoslash shu asosda bo'ladi, hujjat qачон confirm bo'lishidan qat'iy nazar).
+  systemQty        Decimal        @map("system_qty") @db.Decimal(12, 3)
+  countedQty       Decimal        @map("counted_qty") @db.Decimal(12, 3)
+  // Confirm'da to'ldiriladi: musbat farq uchun narx*farq (topilgan qiymat),
+  // manfiy farq uchun FIFO tan-narxi (yo'qotish qiymati) — hisobotlar uchun.
+  adjustmentValue  BigInt?        @map("adjustment_value")
+  // Faqat musbat farq holatida: shu qator ochgan yangi partiya.
+  resultingBatchId String?        @map("resulting_batch_id")
+  resultingBatch   Batch?         @relation("InventoryCountSurplusBatch", fields: [resultingBatchId], references: [id], onDelete: SetNull)
+
+  allocations InventoryAdjustmentAllocation[]
+
+  @@map("inventory_count_items")
+}
+
+// Manfiy farq (kamomad) FIFO orqali qaysi partiyalardan qancha yechilganini
+// saqlaydi — StockOutAllocation bilan bir xil naqsh, cancel'da teskari
+// qaytarish uchun kerak.
+model InventoryAdjustmentAllocation {
+  id                   String             @id @default(uuid())
+  inventoryCountItemId String             @map("inventory_count_item_id")
+  inventoryCountItem   InventoryCountItem @relation(fields: [inventoryCountItemId], references: [id], onDelete: Cascade)
+  batchId              String             @map("batch_id")
+  batch                Batch              @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  qtyTaken             Decimal            @map("qty_taken") @db.Decimal(12, 3)
+  unitCostAtAllocation BigInt             @map("unit_cost_at_allocation")
+  createdAt            DateTime           @default(now()) @map("created_at")
+
+  @@map("inventory_adjustment_allocations")
+}
+
+// ---------- Kassa / Xarajatlar (Phase 5) ----------
+
+model ExpenseCategory {
+  id        String   @id @default(uuid())
+  name      String
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  transactions CashTransaction[]
+
+  @@map("expense_categories")
+}
+
+// O'zgarmas (append-only) kassa jurnali — balans har doim SUM(amount)dan.
+model CashTransaction {
+  id                    String              @id @default(uuid())
+  type                  CashTransactionType
+  // Ishorali: kirim turlari musbat, EXPENSE va bekor qilingan sotuv manfiy.
+  amount                BigInt
+  // Faqat EXPENSE uchun.
+  expenseCategoryId     String?             @map("expense_category_id")
+  expenseCategory       ExpenseCategory?    @relation(fields: [expenseCategoryId], references: [id], onDelete: Restrict)
+  referenceDocumentType String?             @map("reference_document_type")
+  referenceDocumentId   String?             @map("reference_document_id")
+  note                  String?
+  createdBy             String?             @map("created_by")
+  createdAt             DateTime            @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("cash_transactions")
+}
+
+// ---------- Ilova ichidagi bildirishnomalar (Phase 14) ----------
+//
+// Faqat "harakat kerak" turdagi hodisalar uchun (kam qoldiq, qarz limiti) —
+// menejer o'zi qilgan har bir kirim/chiqim uchun o'z-o'ziga bildirishnoma
+// kelmaydi, bu shunchaki shovqin bo'lardi. Crossing-detection mantig'i
+// eski Telegram integratsiyasidan meros (bir marta chegaradan o'tganda,
+// har safar emas) — qarang lib/stock-balance.ts, services/contragentLedgerService.ts.
+model Notification {
+  id         String           @id @default(uuid())
+  type       NotificationType
+  title      String
+  message    String
+  entityType String?          @map("entity_type")
+  entityId   String?          @map("entity_id")
+  isRead     Boolean          @default(false) @map("is_read")
+  createdAt  DateTime         @default(now()) @map("created_at")
+
+  @@index([isRead, createdAt])
+  @@map("notifications")
+}
+
+// ---------- Cross-cutting ----------
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?  @map("user_id")
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  beforeData Json?    @map("before_data")
+  afterData  Json?    @map("after_data")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@map("audit_log")
+}
+
+// Safe, race-free document numbering (kirim/chiqim/reviziya raqamlari) —
+// consumed via a row-level lock (SELECT ... FOR UPDATE) in the service layer
+// once document tables exist (Phase 2+).
+model DocumentSequence {
+  docType    String @map("doc_type")
+  year       Int
+  lastNumber Int    @default(0) @map("last_number")
+
+  @@id([docType, year])
+  @@map("document_sequences")
+}
+
+// Do'kon rekvizitlari — chek, yorliq va chop etiladigan hujjatlar sarlavhasida
+// chiqadi. Tizim bitta magazin uchun mo'ljallangani sabab bu jadvalda doim
+// bitta qator bo'ladi (`id` = SHOP_SETTINGS_ID), ya'ni "sozlama" ma'nosidagi
+// yagona yozuv — ko'p filialli tuzilma ataylab qilinmagan.
+//
+// `logo` — `data:image/...;base64,...` satri (fayl emas). Sababi
+// packages/shared/src/schemas/shop-settings.ts izohida.
+model ShopSetting {
+  id        String   @id
+  name      String
+  address   String?
+  phone     String?
+  logo      String?
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("shop_settings")
+}

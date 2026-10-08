@@ -1,0 +1,34 @@
+import type { FastifyPluginAsync } from "fastify";
+import { authRoutes } from "./auth.js";
+import { tagRoutes } from "./tags.js";
+import { productRoutes } from "./products.js";
+import { contragentRoutes } from "./contragents.js";
+import { auditLogRoutes } from "./audit-log.js";
+import { stockInRoutes } from "./stock-in.js";
+import { stockOutRoutes } from "./stock-out.js";
+import { inventoryCountRoutes } from "./inventory-counts.js";
+import { cashBoxRoutes } from "./cash-box.js";
+import { expenseCategoryRoutes } from "./expense-categories.js";
+import { reportsRoutes } from "./reports.js";
+import { notificationRoutes } from "./notifications.js";
+import { backupRoutes } from "./backup.js";
+import { settingsRoutes } from "./settings.js";
+import { exchangeRateRoutes } from "./exchange-rates.js";
+
+export const registerRoutes: FastifyPluginAsync = async (fastify) => {
+  await fastify.register(authRoutes, { prefix: "/auth" });
+  await fastify.register(tagRoutes, { prefix: "/tags" });
+  await fastify.register(productRoutes, { prefix: "/products" });
+  await fastify.register(contragentRoutes, { prefix: "/contragents" });
+  await fastify.register(auditLogRoutes, { prefix: "/audit-log" });
+  await fastify.register(stockInRoutes, { prefix: "/stock-in" });
+  await fastify.register(stockOutRoutes, { prefix: "/stock-out" });
+  await fastify.register(inventoryCountRoutes, { prefix: "/inventory-counts" });
+  await fastify.register(cashBoxRoutes, { prefix: "/cash-box" });
+  await fastify.register(expenseCategoryRoutes, { prefix: "/expense-categories" });
+  await fastify.register(reportsRoutes, { prefix: "/reports" });
+  await fastify.register(notificationRoutes, { prefix: "/notifications" });
+  await fastify.register(backupRoutes, { prefix: "/backup" });
+  await fastify.register(settingsRoutes, { prefix: "/settings" });
+  await fastify.register(exchangeRateRoutes, { prefix: "/exchange-rates" });
+};
