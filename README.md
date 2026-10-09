@@ -34,6 +34,7 @@ These are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md):
 - **Money is never a float.** Amounts are stored as `BIGINT` and serialized as strings in the API.
 - **Concurrency-safe FIFO.** Batches are locked with `SELECT ... FOR UPDATE` inside a transaction. If stock runs short, the whole document is rejected with `409`; partial allocation is never applied.
 - **Nothing financial is ever deleted.** Cancelling a document creates compensating entries, and master data uses soft delete with `onDelete: Restrict`.
+- **Brute-force protection on login.** `@fastify/rate-limit` applies only to `/auth/login`, so staff who share one shop IP don't block each other.
 - **Audit trail.** Every financial create, confirm or cancel is written to `audit_log` in the same DB transaction.
 - **Notifications fire on threshold crossings.** An alert is sent only when stock or debt crosses its limit during an operation, so repeated alerts don't become noise.
 - **One schema source of truth.** Zod schemas in `packages/shared` validate the API (via `fastify-type-provider-zod`) and type the frontend.
@@ -43,7 +44,7 @@ These are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md):
 | Layer | Tools |
 |---|---|
 | Frontend | Next.js (App Router), React, TanStack Query, Tailwind CSS, Recharts, JsBarcode |
-| Backend | Fastify, Prisma, PostgreSQL, JWT, Zod |
+| Backend | Fastify, Prisma, PostgreSQL, JWT, Zod, rate limiting |
 | Shared | `@oboishop/shared`: Zod schemas, types, enums, error codes |
 | Testing | Vitest: 59 integration tests against a real PostgreSQL database |
 | Tooling | pnpm workspaces, Docker Compose |

@@ -11,7 +11,12 @@ export const authRoutes: FastifyPluginAsync = async (fastify) => {
 
   app.post(
     "/login",
-    { schema: { body: loginSchema, response: { 200: loginResponseSchema } } },
+    {
+      // Parolni taxmin qilishga qarshi: bir IP'dan 15 daqiqada 10 urinish.
+      // Haqiqiy foydalanuvchi bunchaga yetmaydi, bot esa to'xtaydi.
+      config: { rateLimit: { max: 10, timeWindow: "15 minutes" } },
+      schema: { body: loginSchema, response: { 200: loginResponseSchema } },
+    },
     async (request) => {
       const { username, password } = request.body;
 

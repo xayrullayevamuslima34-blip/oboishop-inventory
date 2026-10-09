@@ -16,7 +16,7 @@ coverage/
 apps/api/uploads/
 
 # Barcha .env variantlari (zaxira nusxalar ham) — namunadan tashqari.
-# Masalan apps/api/.env.docker-backup ichida JWT_SECRET va baza paroli bor.
+# Bunday fayllarda DATABASE_URL va JWT_SECRET bo'ladi, git'ga tushmasligi shart.
 .env.*
 !.env.example
 

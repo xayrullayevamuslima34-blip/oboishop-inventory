@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
+import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from "fastify-type-provider-zod";
@@ -14,6 +15,10 @@ import { registerRoutes } from "./routes/index.js";
 
 export async function buildApp() {
   const app = Fastify({
+    // Nginx ortida ishlaymiz — haqiqiy mijoz IP'si X-Forwarded-For'da keladi.
+    // Faqat localhost'dagi nginx'ga ishonamiz (port 4000 tashqaridan yopiq),
+    // aks holda urinish cheklovi hamma uchun bitta hisobga tushib qolardi.
+    trustProxy: "127.0.0.1",
     logger: {
       transport:
         process.env.NODE_ENV === "development"
@@ -26,6 +31,27 @@ export async function buildApp() {
   app.setSerializerCompiler(serializerCompiler);
 
   await app.register(cors, { origin: true });
+
+  // Urinish cheklovi. global: false — butun API bo'ylab emas, faqat aniq
+  // marshrutlarda (hozircha /auth/login). Sababi: bitta do'kondagi barcha
+  // xodimlar bitta tashqi IP ortida bo'ladi, umumiy cheklov ularni bir-biriga
+  // halaqit qilib qo'yardi. Brute-force esa aynan login orqali bo'ladi.
+  // Testlarda o'chiq: test to'plami ketma-ket ko'p marta login qiladi va
+  // cheklov ularni soxta xatoga olib kelardi (barchasi bitta "IP"dan keladi).
+  if (process.env.NODE_ENV !== "test") {
+    await app.register(rateLimit, {
+      global: false,
+      // Vaqt oynasi marshrut darajasida belgilanadi (routes/auth.ts — 15 daqiqa).
+      // context.after inglizcha ("15 minutes") qaytargani uchun matn qo'lda yozilgan.
+      errorResponseBuilder: () => ({
+        statusCode: 429,
+        error: {
+          code: "TOO_MANY_REQUESTS",
+          message: "Juda ko'p urinish. 15 daqiqadan keyin qayta urinib ko'ring.",
+        },
+      }),
+    });
+  }
   await app.register(prismaPlugin);
   await app.register(authPlugin);
 
@@ -43,6 +69,18 @@ export async function buildApp() {
   // of leaking stack traces or ad-hoc shapes to the frontend.
   app.setErrorHandler((rawError, request, reply) => {
     const error = rawError as Error & { code?: string };
+
+    // @fastify/rate-limit cheklovga yetganda javobni xato sifatida uzatadi va u
+    // shu ishlovchiga tushadi. Ushlamasak — pastdagi "noma'lum xato" tarmog'iga
+    // tushib, foydalanuvchiga 429 o'rniga 500 ketadi.
+    const limited = rawError as unknown as {
+      statusCode?: number;
+      error?: { code: string; message: string };
+    };
+    if (limited.statusCode === 429 && limited.error?.code === "TOO_MANY_REQUESTS") {
+      request.log.warn({ ip: request.ip, url: request.url }, "urinish cheklovi");
+      return reply.status(429).send({ error: limited.error });
+    }
 
     if (error instanceof AppError) {
       request.log.warn({ err: error }, "domain error");
